@@ -3,8 +3,6 @@ import gymnasium as gym
 
 class TAIrritoryEnv(gym.Env):
 
-    metadata = {"render.modes": ["human"]}
-
     def __init__(self):
         super(TAIrritoryEnv, self).__init__()
         self.board = np.zeros((7, 3), dtype=int)
@@ -109,6 +107,5 @@ class TAIrritoryEnv(gym.Env):
     def close(self):
         pass
 
-# Register game to gym env to call from gym.make()
 gym.register(id="gymnasium_env/tAIrritory-v0", entry_point=TAIrritoryEnv)
     
