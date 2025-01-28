@@ -2,7 +2,6 @@ import pygame
 import math
 import gymnasium as gym
 from gymnasium.envs.registration import register
-import time
 
 register(
     id="gymnasium_env/tAIrritory-v0",
@@ -17,8 +16,8 @@ class TAIrritoryPygame:
         self.board_width = board_width
         self.board_height = board_height
         self.tile_width = board_width // 3
-        self.tile_height = board_height // board_size
-        # Adjust screen height to make space for the scoreboard
+        self.tile_height = (board_height - 50) // board_size  # Adjust for score area
+
         self.screen = pygame.display.set_mode((board_width, board_height + 50))
         pygame.display.set_caption("tAIrritory")
         self.clock = pygame.time.Clock()
@@ -26,22 +25,35 @@ class TAIrritoryPygame:
         self.env = gym.make("gymnasium_env/tAIrritory-v0")
         self.obs, _ = self.env.reset()
         # Load images
-        self.p2_01 = pygame.transform.scale(
-            pygame.image.load("images/02.svg"), (self.tile_width, self.tile_height)
+        self.p2_01 = pygame.transform.smoothscale(
+            pygame.image.load("images/p2_01.svg"), (self.tile_width, self.tile_height)
         )
-        self.p2_02 = pygame.transform.scale(
-            pygame.image.load("images/03.svg"), (self.tile_width, self.tile_height)
+        self.p2_02 = pygame.transform.smoothscale(
+            pygame.image.load("images/p2_02.svg"), (self.tile_width, self.tile_height)
         )
-        self.p1_01 = pygame.transform.scale(
-            pygame.image.load("images/00.svg"), (self.tile_width, self.tile_height)
+        self.p1_01 = pygame.transform.smoothscale(
+            pygame.image.load("images/p1_01.svg"), (self.tile_width, self.tile_height)
         )
-        self.p1_02 = pygame.transform.scale(
-            pygame.image.load("images/01.svg"), (self.tile_width, self.tile_height)
+        self.p1_02 = pygame.transform.smoothscale(
+            pygame.image.load("images/p1_02.svg"), (self.tile_width, self.tile_height)
         )
         # Game state
         self.selected_piece = None
         self.ai_wins = 0
         self.human_wins = 0
+
+        # Colors and fonts for UI
+        self.colors = {
+            'background': (245, 245, 245),
+            'board': (228, 228, 222),
+            'highlights': (100, 230, 100, 120),
+            'scores': {
+                'background': (230, 230, 230),
+                'text': (50, 50, 50)
+            },
+            'borders': (200, 200, 200)
+        }
+        # self.font = pygame.font.Font("fonts/Sixtyfour Convergence.ttf", 24)
 
     def get_piece_image(self, piece_value):
         piece_map = {
@@ -51,6 +63,65 @@ class TAIrritoryPygame:
             -2: self.p1_02,
         }
         return piece_map.get(piece_value)
+
+    def draw_tile(self, row, col, color=None):
+        rect = pygame.Rect(
+            col * self.tile_width, row * self.tile_height,
+            self.tile_width, self.tile_height
+        )
+        if not color:
+            # Alternating tiles based on (row + col) % 2
+            color = (
+                (228, 228, 222) if (row + col) % 2 == 0 
+                else (11, 11, 11)
+            )
+        pygame.draw.rect(self.screen, color, rect)
+
+    def draw_piece(self, row, col):
+        piece_value = self.obs[row, col]
+        piece_image = self.get_piece_image(piece_value)
+        if piece_image:
+            center_x = col * self.tile_width + self.tile_width // 2
+            center_y = row * self.tile_height + self.tile_height // 2
+            self.screen.blit(
+                piece_image,
+                piece_image.get_rect(center=(center_x, center_y))
+            )
+
+    def draw_highlights(self):
+        if self.selected_piece:
+            selected_row, selected_col = self.selected_piece
+            possible_moves = self.env.unwrapped.possible_move_for_piece(selected_row, selected_col)
+            
+            # Glowing effect with animation
+            time_ms = pygame.time.get_ticks()
+            glow_alpha = int(100 + 50 * math.sin(time_ms * 0.01))
+            for move in possible_moves:
+                self.draw_tile(
+                    move[0], move[1],
+                    color=self.colors['highlights']
+                )
+
+    def draw_score(self):
+        # Create a separate surface for the score with anti-aliasing
+        score_area_rect = pygame.Rect(0, self.board_height, self.board_width, 60)
+        
+        # Fill the background
+        score_surface = pygame.Surface((self.board_width, 60))
+        score_surface.fill(self.colors['background'])
+        score_surface.set_alpha(128)  # Make it semi-transparent
+        
+        # Add text to the surface
+        font = pygame.font.Font("Sixtyfour Convergence", 24)
+        human_text = font.render(f"Humans: {self.human_wins}", True, self.colors['human'])
+        ai_text = font.render(f"AI: {self.ai_wins}", True, self.font_colors['ai'])
+        
+        # Position the text
+        score_surface.blit(human_text, (10, 5))
+        score_surface.blit(ai_text, (self.board_width - ai_text.get_width() - 10, 5))
+        
+        # Apply the score surface to the main screen
+        self.screen.blit(score_surface, score_area_rect)
 
     def draw_board(self):
         self.screen.fill((220, 220, 220))  # Background color
@@ -107,32 +178,6 @@ class TAIrritoryPygame:
         # Draw the score
         self.draw_score()
         pygame.display.flip()
-
-    def draw_score(self):
-        # Fonts and Colors
-        font = pygame.font.SysFont("Sixtyfour Convergence", 22, bold=True)
-        bg_color = (245, 245, 245)  # Light background
-        human_text_color = (211, 47, 47)  # Red for humans
-        ai_text_color = (25, 118, 210)  # Blue for AI
-        border_color = (200, 200, 200)  # Subtle border color
-        # Background for score area
-        score_area_rect = pygame.Rect(0, self.board_height, self.board_width, 60)
-        pygame.draw.rect(self.screen, bg_color, score_area_rect)
-        # Border for the score area
-        pygame.draw.line(self.screen, border_color, (0, self.board_height), (self.board_width, self.board_height), 2)
-        # Icons (optional: you can replace with actual images for more styling)
-        human_icon_rect = pygame.Rect(10, self.board_height + 15, 30, 30)
-        ai_icon_rect = pygame.Rect(self.board_width - 40, self.board_height + 15, 30, 30)
-        pygame.draw.ellipse(self.screen, human_text_color, human_icon_rect)  # Circle for humans
-        pygame.draw.ellipse(self.screen, ai_text_color, ai_icon_rect)  # Circle for AI
-        # Render text for Human and AI
-        human_wins_text = font.render(f"Humans: {self.human_wins}", True, human_text_color)
-        ai_wins_text = font.render(f"{self.ai_wins} :AI", True, ai_text_color)
-        # Positioning Text
-        self.screen.blit(human_wins_text, (50, self.board_height + 20))  # Left-aligned
-        ai_text_width = ai_wins_text.get_width()
-        ai_text_x = self.board_width - ai_text_width - 50  # Right-aligned
-        self.screen.blit(ai_wins_text, (ai_text_x, self.board_height + 20))
 
     def handle_click(self, pos):
         col = pos[0] // self.tile_width
