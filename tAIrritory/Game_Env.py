@@ -79,6 +79,14 @@ class TAIrritoryEnv(gym.Env):
         
         return possible_moves
     
+    def is_piece_active(self, row, col):
+        piece_value = self.board[(row, col)]
+        if (piece_value == -1 or piece_value == -2) and row < 4:
+            return False
+        elif (piece_value == 1 or piece_value == 2) and row > 2:
+            return False
+        return True
+    
     def _is_game_over(self, p_type):
         for row in range(7):
             for col in range(3):
