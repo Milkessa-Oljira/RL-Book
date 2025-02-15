@@ -3,207 +3,273 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.neighbors import NearestNeighbors
-import matplotlib.pyplot as plt
+from collections import deque
+import random
+from tqdm import tqdm
 
-class LatentSpaceEmbedding(nn.Module):
-    def __init__(self, state_dim, action_dim, latent_dim):
-        super(LatentSpaceEmbedding, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(state_dim + action_dim, 64),
+# Set device (GPU if available)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---------------------------
+# Hyperparameters
+# ---------------------------
+LATENT_DIM = 8
+HIDDEN_DIM = 16
+BATCH_SIZE = 16
+GAMMA = 0.9
+LEARNING_RATE = 1e-3
+MEMORY_CAPACITY = 1000
+EPISODES = 100
+MAX_STEPS = 200
+EPS_START = 1.0
+EPS_END = 0.01
+EPS_DECAY = 0.995
+CERT_EPSILON = 0.1   # tolerance for certification (allowed Q-value deviation)
+CONTROLLER_THRESHOLD = 1.0  # TD error threshold for adjusting certification
+CONTROLLER_ALPHA = 0.9  # factor to reduce radius if error is high
+CONTROLLER_BETA = 1.1   # factor to increase radius if error is low
+MIN_RADIUS = 0.01
+MAX_RADIUS = 1.0
+
+# ---------------------------
+# Encoder Network: Maps state to latent space.
+# ---------------------------
+class Encoder(nn.Module):
+    def __init__(self, input_dim=2, latent_dim=LATENT_DIM):
+        super(Encoder, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, HIDDEN_DIM),
             nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, latent_dim)
+            nn.Linear(HIDDEN_DIM, latent_dim)
         )
+        
+    def forward(self, x):
+        return self.net(x)
 
-    def forward(self, state, action):
-        x = torch.cat([state, action], dim=-1)
-        return self.fc(x)
-
-class LatentSpaceModel(nn.Module):
-    def __init__(self, latent_dim, output_dim):  # Output dim depends on what you want to predict
-        super(LatentSpaceModel, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(latent_dim, 64),
+# ---------------------------
+# QNetwork (Generalizer): Estimates Q-values from latent representation.
+# ---------------------------
+class QNetwork(nn.Module):
+    def __init__(self, latent_dim=LATENT_DIM, num_actions=3):
+        super(QNetwork, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, HIDDEN_DIM),
             nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, output_dim)
+            nn.Linear(HIDDEN_DIM, num_actions)
         )
-
+        
     def forward(self, z):
-        return self.fc(z)
+        return self.net(z)
 
+# ---------------------------
+# Replay Buffer for Experience Replay.
+# ---------------------------
+class ReplayBuffer:
+    def __init__(self, capacity=MEMORY_CAPACITY):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+        
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        return (np.array(states), np.array(actions), 
+                np.array(rewards), np.array(next_states), 
+                np.array(dones))
+        
+    def __len__(self):
+        return len(self.buffer)
 
-class MountainCarDeterministic:
-    def __init__(self, epsilon=0.05, latent_dim=4, neighbor_radius=0.2, max_steps=200, learning_rate=0.001):
-        self.env = gym.make('MountainCar-v0')
-        self.epsilon = epsilon
-        self.latent_dim = latent_dim
-        self.neighbor_radius = neighbor_radius
-        self.max_steps = max_steps
-
-        self.phi = LatentSpaceEmbedding(self.env.observation_space.shape[0], 1, latent_dim)  # Now a neural network
-        self.f = LatentSpaceModel(latent_dim, latent_dim) # Predict next latent state
-        self.phi_optimizer = optim.Adam(self.phi.parameters(), lr=learning_rate)
-        self.f_optimizer = optim.Adam(self.f.parameters(), lr=learning_rate)
-        self.mse_loss = nn.MSELoss()
-
-        self.D = []  # Dataset of certified points
-        self.C = set() # Set of certified regions
-        self.knn = NearestNeighbors(radius=neighbor_radius)
-
-    def _compute_r(self, z):
-        if not self.D:
-            return 0
-
-        # CRUCIAL FIX: Reshape BEFORE creating the list for KNN
-        points_for_knn = np.array([point.reshape(-1) for point, _ in self.D])
-        self.knn.fit(points_for_knn)
-
-        z_np = z.detach().numpy().reshape(1, -1)  # Reshape z to (1, latent_dim)
-
-        if any(np.allclose(z_np, point) for point, _ in self.D):
-            certified_z_radius = next(radius for point, radius in self.D if np.allclose(z_np, point))
-            return certified_z_radius
-
-        neighbors_indices = self.knn.radius_neighbors(z_np, return_distance=False)[0]
-        neighbors = [self.D[i][0] for i in neighbors_indices]
-
-        if not neighbors:
-            return 0
-
-        max_radius = 0
-        for neighbor in neighbors:
-            radius = np.linalg.norm(z_np.flatten() - neighbor.flatten())
-
-            all_within_tolerance = True
-            for _ in range(10):
-                perturbation = np.random.uniform(-radius, radius, size=self.latent_dim)
-                z_prime = torch.tensor(neighbor + perturbation, dtype=torch.float32)
-
-                if torch.norm(self.f(z) - self.f(z_prime)) > self.epsilon:
-                    all_within_tolerance = False
-                    break
-
-            if all_within_tolerance:
-                max_radius = max(max_radius, radius)
-
-        return max_radius
-
-    def _update_C(self):
-        self.C = set()
-        for z, r in self.D:
-            for i in range(20):
-                angle = np.random.uniform(0, 2 * np.pi)
-
-                # CRUCIAL FIX: Handle r=0 case separately
-                if r == 0:
-                    sample = z.copy()  # Just use the original z if r is 0
-                else:
-                    perturbation = r * np.array([np.cos(angle), np.sin(angle), 0, 0])[:self.latent_dim]
-                    z_np = z.copy()
-                    sample = z_np + perturbation
-
-                # Ensure sample is 1D before converting to list
-                sample = sample.reshape(-1)  # Flatten
-
-                sample_list = [float(x) for x in sample.tolist()]
-                self.C.add(tuple(sample_list))
-                            
-    def train(self, episodes=100):
-        for episode in range(episodes):
-            state, _ = self.env.reset()
-            total_reward = 0
-            for t in range(self.max_steps):
-                action = self._choose_action(state)
-                next_state, reward, terminated, truncated, _ = self.env.step(action)
-                total_reward += reward
-
-                state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-                action_tensor = torch.tensor([action], dtype=torch.float32).unsqueeze(0)
-                next_state_tensor = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0)
-
-                z = self.phi(state_tensor, action_tensor)
-                next_z = self.phi(next_state_tensor, action_tensor)  # Embedding of the next state
-
-                r = self._compute_r(z)
-
-                # CRUCIAL FIX: Store z as a 2D array (1, latent_dim) in D
-                z_np = z.detach().numpy().reshape(1, -1)  # Reshape before storing
-                self.D.append((z_np, r))  # Store the numpy array
-
-                # Train the embedding and the model f
-                predicted_next_z = self.f(z)
-                loss = self.mse_loss(predicted_next_z, next_z) # Predict next latent state
-
-                self.phi_optimizer.zero_grad()
-                self.f_optimizer.zero_grad()
-                loss.backward()
-                self.phi_optimizer.step()
-                self.f_optimizer.step()
-
-                self._update_C()
-                state = next_state
-
-                if terminated or truncated:
-                    break
-
-            print(f"Episode {episode+1}: Total Reward = {total_reward}")
-
-        self.env.close()
-
-    def _choose_action(self, state):
-        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-        best_action = None
-        max_expansion = -1  # Initialize with a negative value
-
-        for action in range(self.env.action_space.n):  # Iterate through possible actions
-            action_tensor = torch.tensor([action], dtype=torch.float32).unsqueeze(0)
-            z = self.phi(state_tensor, action_tensor)
-
-            # 1. Check if the current latent state is already certified.
-            if any(np.allclose(z.detach().numpy(), point) for point, _ in self.D):
-                continue # If already certified, don't explore more in that direction
-
-            # 2. Estimate potential expansion by "looking ahead"
-            potential_next_state, _, _, _, _ = self.env.step(action) # Simulate one step
-            potential_next_state_tensor = torch.tensor(potential_next_state, dtype=torch.float32).unsqueeze(0)
-            potential_next_z = self.phi(potential_next_state_tensor, action_tensor)
-
-            # 3. Calculate the distance to the nearest certified point.
-            if self.D:
-                distances = [np.linalg.norm(z.detach().numpy() - point) for point, _ in self.D]
-                distance_to_nearest = min(distances)
+# ---------------------------
+# Memory Module: Stores latent samples with certified radius.
+# ---------------------------
+class MemoryModule:
+    def __init__(self):
+        # Each entry is a dict with keys: 'z', 'radius', 'action', 'q_value'
+        self.memory = []
+        
+    def add(self, z, action, q_value, radius):
+        self.memory.append({
+            'z': z, 
+            'radius': radius, 
+            'action': action, 
+            'q_value': q_value
+        })
+        
+    def update_radius(self, td_error):
+        # Adjust each memory sample's radius based on the observed TD error.
+        for entry in self.memory:
+            if td_error > CONTROLLER_THRESHOLD:
+                entry['radius'] = max(MIN_RADIUS, entry['radius'] * CONTROLLER_ALPHA)
             else:
-                distance_to_nearest = float('inf')  # No certified points yet
+                entry['radius'] = min(MAX_RADIUS, entry['radius'] * CONTROLLER_BETA)
+                
+    def get_certified_q(self, z):
+        # Check if latent vector z lies within any certified ball; return average Q-value if so.
+        certified_qs = []
+        for entry in self.memory:
+            if np.linalg.norm(z - entry['z']) <= entry['radius']:
+                certified_qs.append(entry['q_value'])
+        if len(certified_qs) > 0:
+            return np.mean(certified_qs)
+        else:
+            return None
+        
+    def coverage(self, z):
+        # Returns True if z is covered by any certified region.
+        for entry in self.memory:
+            if np.linalg.norm(z - entry['z']) <= entry['radius']:
+                return True
+        return False
 
-            # 4. Encourage exploration of less-explored regions (farthest from certified points)
-            expansion_potential = distance_to_nearest
+# ---------------------------
+# Compute Certified Radius: Binary search to determine maximal radius
+# such that perturbations in the latent space do not change the Q-value (for the given action)
+# by more than CERT_EPSILON.
+# ---------------------------
+def compute_certified_radius(encoder, q_network, z, action, epsilon=CERT_EPSILON, 
+                             min_r=MIN_RADIUS, max_r=MAX_RADIUS, num_samples=10, tol=1e-3):
+    low = min_r
+    high = max_r
+    best_r = low
+    while high - low > tol:
+        mid = (low + high) / 2.0
+        # Sample random perturbations in the latent space ball of radius 'mid'
+        deltas = np.random.randn(num_samples, z.shape[0])
+        norms = np.linalg.norm(deltas, axis=1, keepdims=True)
+        deltas = deltas / (norms + 1e-6)  # unit vectors
+        scales = np.random.uniform(0, mid, size=(num_samples, 1))
+        perturbations = deltas * scales
+        z_perturbed = z + perturbations  # shape: (num_samples, latent_dim)
+        z_tensor = torch.tensor(z_perturbed, dtype=torch.float32, device=device)
+        q_vals = q_network(z_tensor)  # shape: (num_samples, num_actions)
+        q_vals = q_vals[:, action].detach().cpu().numpy()
+        # Compute Q-value at the original latent vector z for the given action.
+        z_orig_tensor = torch.tensor(z, dtype=torch.float32, device=device).unsqueeze(0)
+        q_orig = q_network(z_orig_tensor)[0, action].item()
+        differences = np.abs(q_vals - q_orig)
+        if np.max(differences) <= epsilon:
+            best_r = mid
+            low = mid  # Try expanding the radius.
+        else:
+            high = mid  # Decrease the radius.
+    return best_r
 
-            if expansion_potential > max_expansion:
-                max_expansion = expansion_potential
-                best_action = action
+# ---------------------------
+# DQN Agent integrating Memory, Generalizer, and Controller.
+# ---------------------------
+class DQNAgent:
+    def __init__(self, state_dim, action_dim):
+        self.encoder = Encoder(input_dim=state_dim).to(device)
+        self.q_network = QNetwork(latent_dim=LATENT_DIM, num_actions=action_dim).to(device)
+        self.target_q_network = QNetwork(latent_dim=LATENT_DIM, num_actions=action_dim).to(device)
+        self.target_q_network.load_state_dict(self.q_network.state_dict())
+        self.optimizer = optim.Adam(list(self.encoder.parameters()) + 
+                                    list(self.q_network.parameters()), lr=LEARNING_RATE)
+        self.replay_buffer = ReplayBuffer()
+        self.memory_module = MemoryModule()
+        self.epsilon = EPS_START
+        self.action_dim = action_dim
+        
+    def select_action(self, state):
+        # Convert state to tensor and encode into latent space.
+        state_tensor = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+        z = self.encoder(state_tensor).detach().cpu().numpy().squeeze()
+        # If a certified Q-value exists in memory for this latent state, use it (if not exploring).
+        certified_q = self.memory_module.get_certified_q(z)
+        if certified_q is not None and np.random.rand() > self.epsilon:
+            # Use the Q-network prediction here as the certified Q is a scalar; we pick the best action.
+            with torch.no_grad():
+                q_vals = self.q_network(self.encoder(state_tensor))
+            action = q_vals.argmax().item()
+        else:
+            # Epsilon-greedy action selection.
+            if np.random.rand() < self.epsilon:
+                action = np.random.randint(self.action_dim)
+            else:
+                with torch.no_grad():
+                    q_vals = self.q_network(self.encoder(state_tensor))
+                action = q_vals.argmax().item()
+        return action
+    
+    def update(self):
+        if len(self.replay_buffer) < BATCH_SIZE:
+            return
+        states, actions, rewards, next_states, dones = self.replay_buffer.sample(BATCH_SIZE)
+        states = torch.tensor(states, dtype=torch.float32, device=device)
+        actions = torch.tensor(actions, dtype=torch.long, device=device)
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+        next_states = torch.tensor(next_states, dtype=torch.float32, device=device)
+        dones = torch.tensor(dones, dtype=torch.float32, device=device)
+        
+        # Encode current states
+        z_states = self.encoder(states)
+        q_values = self.q_network(z_states)
+        q_values = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
+        
+        # Compute target Q-values using the target network.
+        with torch.no_grad():
+            z_next = self.encoder(next_states)
+            next_q_values = self.target_q_network(z_next)
+            next_q_max, _ = next_q_values.max(dim=1)
+            target_q = rewards + GAMMA * next_q_max * (1 - dones)
+        
+        loss = nn.MSELoss()(q_values, target_q)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        # Compute TD errors for the batch.
+        td_errors = torch.abs(q_values - target_q).detach().cpu().numpy()
+        # For each sample in the batch, update the memory module.
+        for i in range(BATCH_SIZE):
+            z = z_states[i].detach().cpu().numpy()
+            action = actions[i].item()
+            q_val = q_values[i].item()
+            # Compute certified radius using the current encoder and Q-network.
+            radius = compute_certified_radius(self.encoder, self.q_network, z, action)
+            self.memory_module.add(z, action, q_val, radius)
+        
+        # Use average TD error from the batch to update memory radii via the Controller.
+        avg_td_error = np.mean(td_errors)
+        self.memory_module.update_radius(avg_td_error)
+        
+    def update_target_network(self):
+        self.target_q_network.load_state_dict(self.q_network.state_dict())
+        
+    def decay_epsilon(self):
+        self.epsilon = max(EPS_END, self.epsilon * EPS_DECAY)
 
-        # If no promising action was found (all were already certified or no certified points at all), explore randomly
-        if best_action is None:
-            return self.env.action_space.sample()
-
-        return best_action
-
-    def plot_certified_region(self):
-         # ... (same as before)
-        if self.C:
-            certified_region_np = np.array(list(self.C))
-            plt.scatter(certified_region_np[:, 0], certified_region_np[:, 1], s=1, label="Certified Region")
-            plt.xlabel("Position")
-            plt.ylabel("Velocity")
-            plt.title("Certified Region in State Space")
-            plt.legend()
-            plt.show()
+# ---------------------------
+# Main Training Loop
+# ---------------------------
+def train():
+    env = gym.make("MountainCar-v0")
+    state_dim = env.observation_space.shape[0]  # Typically 2: position and velocity.
+    action_dim = env.action_space.n              # Typically 3 actions.
+    agent = DQNAgent(state_dim, action_dim)
+    
+    scores = []
+    for episode in tqdm(range(EPISODES)):
+        state, _ = env.reset()
+        total_reward = 0
+        for t in range(MAX_STEPS):
+            action = agent.select_action(state)
+            next_state, reward, done, truncated, _ = env.step(action)
+            # In MountainCar-v0, reward is -1 per timestep until the goal is reached.
+            agent.replay_buffer.push(state, action, reward, next_state, done or truncated)
+            state = next_state
+            total_reward += reward
+            agent.update()
+            if done or truncated:
+                break
+        agent.update_target_network()
+        agent.decay_epsilon()
+        scores.append(total_reward)
+        print(f"Episode {episode+1}, Total Reward: {total_reward}, Epsilon: {agent.epsilon:.3f}")
+    env.close()
+    return scores
 
 if __name__ == "__main__":
-    agent = MountainCarDeterministic()
-    agent.train(episodes=50)
-    agent.plot_certified_region()
+    scores = train()
